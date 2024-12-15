@@ -7,7 +7,8 @@ use crate::{
     utils::{bit_set, generate_peer_id},
     MAX_PEERS,
 };
-use futures_util::StreamExt;
+use tokio::time::{Duration, timeout};
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
@@ -33,6 +34,8 @@ pub struct Download {
     downloaded: Vec<u8>,
 }
 
+// src/download.rs
+
 impl Download {
     pub async fn new(torrent: Torrent) -> Result<Self> {
         println!("Initializing download for: {}", torrent.info.name);
@@ -42,20 +45,49 @@ impl Download {
         println!("Found {} potential peers", peer_list.len());
         let info_hash = torrent.info_hash();
         let mut peers = Vec::new();
-        
-        // Connect to peers
-        println!("Attempting to connect to peers...");
-        let mut peer_stream = futures_util::stream::iter(peer_list)
-            .map(|addr| async move { Peer::connect(addr, info_hash, generate_peer_id()).await })
-            .buffer_unordered(5);
 
-        while let Some(peer_result) = peer_stream.next().await {
-            if let Ok(peer) = peer_result {
-                println!("Successfully connected to peer: {}", peer.addr());
-                peers.push(peer);
-                if peers.len() >= MAX_PEERS {
-                    break;
+        // Try to connect to peers concurrently with a timeout
+        let connect_timeout = Duration::from_secs(30);
+        let mut peer_futures = FuturesUnordered::new();
+        
+        // Start with a smaller batch of connection attempts
+        for addr in peer_list.iter().take(25) {
+            peer_futures.push(Peer::connect(*addr, info_hash, generate_peer_id()));
+        }
+
+        let mut connected_peers = 0;
+        let start_time = std::time::Instant::now();
+
+        while let Some(result) = timeout(connect_timeout, peer_futures.next()).await? {
+            match result {
+                Ok(peer) => {
+                    peers.push(peer);
+                    connected_peers += 1;
+                    if connected_peers >= MAX_PEERS {
+                        break;
+                    }
                 }
+                Err(e) => {
+                    println!("Failed to connect to peer: {}", e);
+                }
+            }
+
+            // If we're running low on connection attempts and haven't reached our target,
+            // add more peers to try
+            if peer_futures.len() < 5 && connected_peers < MAX_PEERS {
+                let next_peers = peer_list.iter()
+                    .skip(25 + connected_peers)
+                    .take(5);
+                
+                for addr in next_peers {
+                    peer_futures.push(Peer::connect(*addr, info_hash, generate_peer_id()));
+                }
+            }
+
+            // Break if we've been trying too long
+            if start_time.elapsed() > Duration::from_secs(60) {
+                println!("Connection phase timeout reached");
+                break;
             }
         }
 
@@ -63,14 +95,15 @@ impl Download {
             return Err(BitTorrentError::Peer("No peers available".into()));
         }
 
-        // Initialize piece manager
+        println!("Successfully connected to {} peers", peers.len());
+
+        // Initialize piece manager and download buffer
         let piece_manager = PieceManager::new(
             torrent.info.piece_length,
             torrent.info.pieces.0.clone(),
             torrent.total_length(),
         );
 
-        // Pre-allocate download buffer
         let downloaded = vec![0; torrent.total_length()];
 
         Ok(Self {
