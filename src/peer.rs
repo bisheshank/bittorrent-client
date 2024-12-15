@@ -10,6 +10,7 @@ use futures_util::{SinkExt, StreamExt};
 use std::net::{SocketAddr, SocketAddrV4};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::{timeout, Duration};
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
 const PROTOCOL: &[u8] = b"BitTorrent protocol";
@@ -102,6 +103,7 @@ impl Peer {
         if received.info_hash != info_hash {
             return Err(BitTorrentError::Protocol("Info hash mismatch".into()));
         }
+        println!("Successful handshake: {}", addr);
 
         // Now switch to message protocol
         let mut framed = Framed::new(stream, PeerCodec::new());
@@ -141,72 +143,149 @@ impl Peer {
             return Err(BitTorrentError::Peer("Peer doesn't have piece".into()));
         }
 
-        // Express interest if we haven't already
-        if !self.am_interested {
-            self.stream
-                .send(Message::new(MessageId::Interested, Vec::new()))
-                .await?;
-            self.am_interested = true;
-        }
+        // Try to get unchoked with timeout
+        if !self.am_interested || self.peer_choking {
+            if !self.am_interested {
+                self.stream
+                    .send(Message::new(MessageId::Interested, Vec::new()))
+                    .await?;
+                self.am_interested = true;
+            }
 
-        // Wait to be unchoked
-        while self.peer_choking {
-            let msg = self.stream.next().await.ok_or_else(|| {
-                BitTorrentError::Peer("Peer disconnected while waiting for unchoke".into())
-            })??;
+            // Wait for unchoke with timeout
+            let unchoke_timeout = Duration::from_secs(30);
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
 
-            self.handle_message(msg).await?;
+            let unchoke_result = timeout(unchoke_timeout, async {
+                while self.peer_choking {
+                    interval.tick().await;
+
+                    // Periodically resend interested message
+                    self.stream
+                        .send(Message::new(MessageId::Interested, Vec::new()))
+                        .await?;
+
+                    // Process any incoming messages
+                    while let Ok(Some(msg)) =
+                        timeout(Duration::from_secs(1), self.stream.next()).await
+                    {
+                        match msg {
+                            Ok(msg) => {
+                                self.handle_message(msg).await?;
+                                if !self.peer_choking {
+                                    return Ok(());
+                                }
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .await;
+
+            match unchoke_result {
+                Ok(Ok(())) => {
+                    println!("Successfully unchoked by peer {}", self.addr);
+                }
+                Ok(Err(e)) => {
+                    return Err(e);
+                }
+                Err(_) => {
+                    return Err(BitTorrentError::Peer("Timeout waiting for unchoke".into()));
+                }
+            }
         }
 
         let mut data = Vec::with_capacity(piece.length());
         let mut offset = 0;
+        let mut retries = 0;
+        const MAX_BLOCK_RETRIES: u32 = 3;
 
         while offset < piece.length() {
             let block_size = std::cmp::min(BLOCK_SIZE, piece.length() - offset);
 
-            // Send request
+            // Send block request
             let mut request = vec![0u8; 12];
             (&mut request[0..4]).put_u32(piece.index() as u32);
             (&mut request[4..8]).put_u32(offset as u32);
             (&mut request[8..12]).put_u32(block_size as u32);
 
-            self.stream
-                .send(Message::new(MessageId::Request, request))
-                .await?;
+            let block_result = timeout(
+                Duration::from_secs(30),
+                self.request_block(request.clone(), piece.index(), offset),
+            )
+            .await;
 
-            // Wait for piece data
-            loop {
-                let msg = self.stream.next().await.ok_or_else(|| {
-                    BitTorrentError::Peer("Peer disconnected while requesting piece".into())
-                })??;
-
-                if msg.id == MessageId::Piece {
-                    if msg.payload.len() < 8 {
-                        return Err(BitTorrentError::Protocol("Invalid piece message".into()));
-                    }
-
-                    let index = (&msg.payload[0..4]).get_u32() as usize;
-                    let begin = (&msg.payload[4..8]).get_u32() as usize;
-
-                    if index != piece.index() || begin != offset {
-                        continue; // Wrong piece or offset, ignore
-                    }
-
-                    let block_data = &msg.payload[8..];
-                    if block_data.len() != block_size {
-                        return Err(BitTorrentError::Protocol("Invalid block size".into()));
-                    }
-
-                    data.extend_from_slice(block_data);
+            match block_result {
+                Ok(Ok(block_data)) => {
+                    data.extend_from_slice(&block_data);
                     offset += block_size;
-                    break;
-                } else {
-                    self.handle_message(msg).await?;
+                    retries = 0;
+                }
+                _ => {
+                    retries += 1;
+                    if retries >= MAX_BLOCK_RETRIES {
+                        return Err(BitTorrentError::Peer(format!(
+                            "Failed to download block after {} retries",
+                            MAX_BLOCK_RETRIES
+                        )));
+                    }
+                    // Small delay before retry
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
                 }
             }
         }
 
         Ok(data)
+    }
+
+    async fn request_block(
+        &mut self,
+        request: Vec<u8>,
+        expected_index: usize,
+        expected_begin: usize,
+    ) -> Result<Vec<u8>> {
+        self.stream
+            .send(Message::new(MessageId::Request, request))
+            .await?;
+
+        // Wait for piece data
+        while let Some(msg) = self.stream.next().await {
+            match msg {
+                Ok(msg) => match msg.id {
+                    MessageId::Piece => {
+                        if msg.payload.len() < 8 {
+                            continue;
+                        }
+
+                        let index = (&msg.payload[0..4]).get_u32() as usize;
+                        let begin = (&msg.payload[4..8]).get_u32() as usize;
+
+                        if index != expected_index || begin != expected_begin {
+                            continue;
+                        }
+
+                        return Ok(msg.payload[8..].to_vec());
+                    }
+                    MessageId::Choke => {
+                        self.peer_choking = true;
+                        return Err(BitTorrentError::Peer(
+                            "Peer choked us during transfer".into(),
+                        ));
+                    }
+                    _ => {
+                        self.handle_message(msg).await?;
+                    }
+                },
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(BitTorrentError::Peer(
+            "Peer disconnected during block transfer".into(),
+        ))
     }
 
     pub fn has_piece(&self, index: usize) -> bool {
@@ -336,4 +415,3 @@ impl Encoder<Message> for PeerCodec {
         Ok(())
     }
 }
-

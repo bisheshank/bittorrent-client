@@ -1,6 +1,6 @@
-use std::collections::{HashMap, HashSet};
-use std::cmp::Ordering;
 use sha1::{Digest, Sha1};
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct PieceInfo {
@@ -40,7 +40,8 @@ impl PieceInfo {
 // Keep the existing Ord implementation style for PieceInfo
 impl Ord for PieceInfo {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.priority.cmp(&other.priority)
+        self.priority
+            .cmp(&other.priority)
             .then_with(|| self.index.cmp(&other.index))
     }
 }
@@ -101,6 +102,34 @@ impl PieceManager {
         }
     }
 
+    pub fn next_piece_excluding(
+        &mut self,
+        peer_id: usize,
+        excluded_pieces: &HashSet<usize>,
+    ) -> Option<PieceInfo> {
+        let peer_pieces = self.peer_pieces.get(&peer_id)?;
+
+        // Find rarest piece this peer has that we haven't downloaded and hasn't failed
+        let mut piece_counts = HashMap::new();
+        for pieces in self.peer_pieces.values() {
+            for &piece_index in pieces {
+                if !self.completed_pieces.contains(&piece_index)
+                    && !excluded_pieces.contains(&piece_index)
+                {
+                    *piece_counts.entry(piece_index).or_insert(0) += 1;
+                }
+            }
+        }
+
+        peer_pieces
+            .iter()
+            .filter(|&&index| {
+                !self.completed_pieces.contains(&index) && !excluded_pieces.contains(&index)
+            })
+            .min_by_key(|&&index| piece_counts.get(&index).unwrap_or(&0))
+            .map(|&index| self.pieces[index].clone())
+    }
+
     pub fn register_peer(&mut self, peer_id: usize) {
         self.peer_pieces.insert(peer_id, HashSet::new());
     }
@@ -117,7 +146,7 @@ impl PieceManager {
 
     pub fn next_piece(&self, peer_id: usize) -> Option<PieceInfo> {
         let peer_pieces = self.peer_pieces.get(&peer_id)?;
-        
+
         // Find rarest piece this peer has that we haven't downloaded
         let mut piece_counts = HashMap::new();
         for pieces in self.peer_pieces.values() {
@@ -178,7 +207,7 @@ mod tests {
     fn test_piece_manager() {
         let hashes = vec![[0; 20], [1; 20], [2; 20]];
         let mut manager = PieceManager::new(1024, hashes, 2500);
-        
+
         manager.register_peer(1);
         manager.add_peer_piece(1, 0);
         manager.add_peer_piece(1, 1);
@@ -192,7 +221,7 @@ mod tests {
         assert_eq!(next.index(), 0);
 
         manager.mark_completed(0);
-        
+
         // Now should select piece 1 since 0 is completed
         let next = manager.next_piece(1).unwrap();
         assert_eq!(next.index(), 1);

@@ -7,10 +7,10 @@ use crate::{
     utils::{bit_set, generate_peer_id},
     MAX_PEERS,
 };
-use tokio::time::{Duration, timeout};
 use futures_util::{stream::FuturesUnordered, StreamExt};
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 use tokio::sync::{mpsc, Mutex};
+use tokio::time::{timeout, Duration};
 
 #[derive(Debug)]
 enum TaskMessage {
@@ -34,8 +34,6 @@ pub struct Download {
     downloaded: Vec<u8>,
 }
 
-// src/download.rs
-
 impl Download {
     pub async fn new(torrent: Torrent) -> Result<Self> {
         println!("Initializing download for: {}", torrent.info.name);
@@ -43,56 +41,65 @@ impl Download {
         println!("Connecting to tracker at: {}", torrent.announce);
         let peer_list = tracker.get_peers().await?;
         println!("Found {} potential peers", peer_list.len());
+
         let info_hash = torrent.info_hash();
         let mut peers = Vec::new();
+        let mut failed_attempts = 0;
+        const MAX_FAILED_ATTEMPTS: usize = 200;
+        const CONCURRENT_CONNECTS: usize = 50;
+        const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-        // Try to connect to peers concurrently with a timeout
-        let connect_timeout = Duration::from_secs(30);
-        let mut peer_futures = FuturesUnordered::new();
-        
-        // Start with a smaller batch of connection attempts
-        for addr in peer_list.iter().take(25) {
-            peer_futures.push(Peer::connect(*addr, info_hash, generate_peer_id()));
+        // Create a pool of connection futures
+        let mut connection_pool = FuturesUnordered::new();
+
+        // Initialize with first batch of connection attempts
+        for addr in peer_list.iter().take(CONCURRENT_CONNECTS) {
+            connection_pool.push(timeout(
+                CONNECT_TIMEOUT,
+                Peer::connect(*addr, info_hash, generate_peer_id()),
+            ));
         }
 
-        let mut connected_peers = 0;
-        let start_time = std::time::Instant::now();
+        let mut peer_index = CONCURRENT_CONNECTS;
 
-        while let Some(result) = timeout(connect_timeout, peer_futures.next()).await? {
+        while let Some(result) = connection_pool.next().await {
             match result {
-                Ok(peer) => {
+                Ok(Ok(peer)) => {
+                    println!("Successfully connected to peer: {}", peer.addr());
                     peers.push(peer);
-                    connected_peers += 1;
-                    if connected_peers >= MAX_PEERS {
+
+                    if peers.len() >= MAX_PEERS {
                         break;
                     }
                 }
-                Err(e) => {
-                    println!("Failed to connect to peer: {}", e);
+                _ => {
+                    failed_attempts += 1;
+                    if failed_attempts >= MAX_FAILED_ATTEMPTS {
+                        println!("Reached maximum failed connection attempts");
+                        break;
+                    }
                 }
             }
 
-            // If we're running low on connection attempts and haven't reached our target,
-            // add more peers to try
-            if peer_futures.len() < 5 && connected_peers < MAX_PEERS {
-                let next_peers = peer_list.iter()
-                    .skip(25 + connected_peers)
-                    .take(5);
-                
-                for addr in next_peers {
-                    peer_futures.push(Peer::connect(*addr, info_hash, generate_peer_id()));
-                }
+            // Add new connection attempt if we have more peers to try
+            if peer_index < peer_list.len() {
+                connection_pool.push(timeout(
+                    CONNECT_TIMEOUT,
+                    Peer::connect(peer_list[peer_index], info_hash, generate_peer_id()),
+                ));
+                peer_index += 1;
             }
 
-            // Break if we've been trying too long
-            if start_time.elapsed() > Duration::from_secs(60) {
-                println!("Connection phase timeout reached");
+            // Break if we have no more pending connections and enough peers
+            if connection_pool.is_empty() || peers.len() >= MAX_PEERS {
                 break;
             }
         }
 
         if peers.is_empty() {
-            return Err(BitTorrentError::Peer("No peers available".into()));
+            return Err(BitTorrentError::Peer(
+                "Failed to connect to any peers".into(),
+            ));
         }
 
         println!("Successfully connected to {} peers", peers.len());
@@ -120,23 +127,28 @@ impl Download {
         task_concurrency: usize,
     ) -> mpsc::Receiver<TaskMessage> {
         let (tx, rx) = mpsc::channel(task_concurrency * 2);
+        let piece_manager_clone = Arc::clone(&piece_manager);
 
         for (peer_id, mut peer) in peers.into_iter().enumerate() {
             let tx = tx.clone();
             let piece_manager = Arc::clone(&piece_manager);
 
             tokio::spawn(async move {
-                let mut active = true;
-                
-                while active {
+                let mut consecutive_failures = 0;
+                const MAX_CONSECUTIVE_FAILURES: usize = 3;
+                let mut failed_pieces = HashSet::new();
+
+                while consecutive_failures < MAX_CONSECUTIVE_FAILURES {
                     // Get next piece under lock
                     let piece = {
                         let mut pm = piece_manager.lock().await;
-                        pm.next_piece(peer_id)
+                        // Don't request pieces that have failed for this peer
+                        pm.next_piece_excluding(peer_id, &failed_pieces)
                     };
 
                     match piece {
                         Some(piece) => {
+                            println!("Peer {} requesting piece {}", peer_id, piece.index());
                             match peer.request_piece(&piece).await {
                                 Ok(data) => {
                                     let verified = {
@@ -145,6 +157,7 @@ impl Download {
                                     };
 
                                     if verified {
+                                        consecutive_failures = 0;
                                         let msg = TaskMessage::PieceCompleted {
                                             index: piece.index(),
                                             data,
@@ -153,9 +166,13 @@ impl Download {
                                             break;
                                         }
                                     } else {
+                                        consecutive_failures += 1;
+                                        failed_pieces.insert(piece.index());
                                         let msg = TaskMessage::PieceFailed {
                                             index: piece.index(),
-                                            error: BitTorrentError::Piece("Verification failed".into()),
+                                            error: BitTorrentError::Piece(
+                                                "Verification failed".into(),
+                                            ),
                                         };
                                         if tx.send(msg).await.is_err() {
                                             break;
@@ -163,11 +180,20 @@ impl Download {
                                     }
                                 }
                                 Err(e) => {
+                                    consecutive_failures += 1;
+                                    failed_pieces.insert(piece.index());
+
                                     if e.is_connection_error() {
                                         let msg = TaskMessage::PeerDisconnected { peer_id };
                                         let _ = tx.send(msg).await;
-                                        active = false;
+                                        break;
                                     } else {
+                                        println!(
+                                            "Peer {} failed to download piece {}: {:?}",
+                                            peer_id,
+                                            piece.index(),
+                                            e
+                                        );
                                         let msg = TaskMessage::PieceFailed {
                                             index: piece.index(),
                                             error: e,
@@ -180,7 +206,8 @@ impl Download {
                             }
                         }
                         None => {
-                            active = false;
+                            // No more pieces available for this peer
+                            break;
                         }
                     }
                 }
@@ -188,6 +215,7 @@ impl Download {
                 // Clean up peer when done
                 let mut pm = piece_manager.lock().await;
                 pm.remove_peer(peer_id);
+                println!("Peer {} task completed", peer_id);
             });
         }
 
@@ -200,7 +228,7 @@ impl Download {
         println!("Number of pieces: {}", self.torrent.info.pieces.0.len());
 
         let piece_manager = Arc::new(Mutex::new(std::mem::take(&mut self.piece_manager)));
-        
+
         // Initialize piece manager with peers
         {
             let mut pm = piece_manager.lock().await;
@@ -220,7 +248,8 @@ impl Download {
             std::mem::take(&mut self.peers),
             Arc::clone(&piece_manager),
             5,
-        ).await;
+        )
+        .await;
 
         let total_pieces = self.torrent.info.pieces.0.len();
         let mut completed_pieces = 0;
@@ -261,23 +290,29 @@ impl Download {
             self.piece_manager = Arc::try_unwrap(piece_manager)
                 .expect("All tasks should be done")
                 .into_inner();
-            
-            println!("Entering endgame mode for {} remaining pieces", failed_pieces.len());
+
+            println!(
+                "Entering endgame mode for {} remaining pieces",
+                failed_pieces.len()
+            );
             self.handle_endgame(&failed_pieces).await?;
         }
 
         let is_complete = failed_pieces.is_empty() && completed_pieces == total_pieces;
-        
+
         if is_complete {
             Ok(self.downloaded.clone())
         } else {
-            Err(BitTorrentError::Download("Failed to download all pieces".into()))
+            Err(BitTorrentError::Download(
+                "Failed to download all pieces".into(),
+            ))
         }
     }
 
     async fn handle_endgame(&mut self, failed_pieces: &[usize]) -> Result<()> {
         for &piece_index in failed_pieces {
-            let piece_info = self.piece_manager
+            let piece_info = self
+                .piece_manager
                 .get_piece(piece_index)
                 .ok_or_else(|| BitTorrentError::Piece("Piece info not found".into()))?;
 
@@ -294,7 +329,10 @@ impl Download {
                             }
                         }
                         Err(e) => {
-                            println!("Endgame: Failed to download piece {} from peer: {:?}", piece_index, e);
+                            println!(
+                                "Endgame: Failed to download piece {} from peer: {:?}",
+                                piece_index, e
+                            );
                             continue;
                         }
                     }
@@ -302,9 +340,10 @@ impl Download {
             }
 
             if !success {
-                return Err(BitTorrentError::Piece(
-                    format!("Failed to download piece {} in endgame mode", piece_index)
-                ));
+                return Err(BitTorrentError::Piece(format!(
+                    "Failed to download piece {} in endgame mode",
+                    piece_index
+                )));
             }
         }
 

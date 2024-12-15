@@ -22,28 +22,12 @@ async fn main() -> Result<()> {
         client_lock.add_torrent(&torrent_path).await?;
     }
 
-    // Start progress reporting in separate task
-    let progress_client = Arc::clone(&client);
-    let progress_handle = tokio::spawn(async move {
-        loop {
-            let progress = {
-                let client_lock = progress_client.lock().await;
-                client_lock.progress()
-            };
-            
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        }
-    });
-
     // Start the download
     println!("Starting download...");
     let data = {
         let mut client_lock = client.lock().await;
         client_lock.start_download().await?
     };
-
-    // Cancel progress reporting
-    progress_handle.abort();
 
     // Write data to output file
     let output_path = torrent_path.with_extension("out");
