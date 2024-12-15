@@ -31,24 +31,84 @@ struct TrackerResponse {
     #[serde(default)]
     incomplete: Option<u32>,
     #[serde(default)]
-    #[serde(rename = "failure reason")]
-    failure_reason: Option<String>,
+    warning_message: Option<String>,
     #[serde(default)]
-    peers: PeerList,
+    failure_reason: Option<String>,
+    peers: Peers,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum PeerList {
-    Binary(Vec<u8>),
-    Dict(Vec<PeerDict>),
-}
+#[derive(Debug)]
+struct Peers(Vec<SocketAddrV4>);
 
-impl Default for PeerList {
-    fn default() -> Self {
-        PeerList::Binary(Vec::new())
+impl<'de> Deserialize<'de> for Peers {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct PeersVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for PeersVisitor {
+            type Value = Peers;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("string or list of peer dictionaries")
+            }
+
+            fn visit_bytes<E>(self, v: &[u8]) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if v.len() % 6 != 0 {
+                    return Err(E::custom(format!(
+                        "peer string length must be multiple of 6, got {}",
+                        v.len()
+                    )));
+                }
+
+                let peers = v
+                    .chunks_exact(6)
+                    .filter_map(|chunk| {
+                        let ip = std::net::Ipv4Addr::new(
+                            chunk[0],
+                            chunk[1],
+                            chunk[2],
+                            chunk[3],
+                        );
+                        let port = u16::from_be_bytes([chunk[4], chunk[5]]);
+                        Some(SocketAddrV4::new(ip, port))
+                    })
+                    .collect();
+
+                Ok(Peers(peers))
+            }
+
+            // Optional: Also handle dictionary format if needed
+            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                #[derive(Deserialize)]
+                struct PeerDict {
+                    ip: String,
+                    port: u16,
+                    #[serde(default)]
+                    peer_id: Option<String>,
+                }
+
+                let mut peers = Vec::new();
+                while let Some(peer) = seq.next_element::<PeerDict>()? {
+                    if let Ok(ip) = peer.ip.parse() {
+                        peers.push(SocketAddrV4::new(ip, peer.port));
+                    }
+                }
+                Ok(Peers(peers))
+            }
+        }
+
+        deserializer.deserialize_any(PeersVisitor)
     }
 }
+
 
 #[derive(Debug, Deserialize)]
 struct PeerDict {
@@ -82,7 +142,6 @@ impl Tracker {
     }
 
     pub async fn get_peers(&self) -> Result<Vec<SocketAddrV4>> {
-        println!("Contacting tracker: {}", self.announce_url);
         let request = TrackerRequest {
             info_hash: &self.info_hash,
             peer_id: &self.peer_id,
@@ -95,101 +154,55 @@ impl Tracker {
         };
 
         let url = self.build_tracker_url(&request)?;
-        println!("Full tracker URL: {}", url);
+        println!("Requesting peers from tracker: {}", url);
 
-        // Create a client with debug headers
-        let client = reqwest::Client::builder()
-            .user_agent("BitTorrent/1.0")
-            .build()?;
-
-        // Make the request and print detailed response info
-        let response = client.get(url).send().await?;
-
+        let response = reqwest::get(url).await?;
         println!("Response status: {}", response.status());
-        println!("Response headers: {:#?}", response.headers());
+        
+        let bytes = response.bytes().await?;
+        let response: TrackerResponse = serde_bencode::from_bytes(&bytes)
+            .map_err(|e| BitTorrentError::Tracker(format!("Failed to decode response: {}", e)))?;
 
-        // Get the response body
-        let body = response.bytes().await?;
-        println!("Response length: {}", body.len());
-
-        if body.is_empty() {
-            return Err(BitTorrentError::Tracker(
-                "Empty response from tracker".into(),
-            ));
+        let peers = response.peers.0;
+        println!("Successfully decoded {} peers", peers.len());
+        
+        if peers.is_empty() {
+            return Err(BitTorrentError::Tracker("No peers available".into()));
         }
 
-        let response: TrackerResponse = match serde_bencode::from_bytes::<TrackerResponse>(&body) {
-            Ok(resp) => {
-                println!("Successfully decoded tracker response");
-                println!("Interval: {} seconds", resp.interval);
-                if let Some(min_interval) = resp.min_interval {
-                    println!("Min interval: {} seconds", min_interval);
-                }
-                if let Some(complete) = resp.complete {
-                    println!("Complete (seeders): {}", complete);
-                }
-                if let Some(incomplete) = resp.incomplete {
-                    println!("Incomplete (leechers): {}", incomplete);
-                }
-                resp
-            }
-            Err(e) => {
-                println!("Failed to decode response: {:?}", e);
-                println!("Raw response: {:?}", String::from_utf8_lossy(&body));
-                return Err(BitTorrentError::Tracker(e.to_string()));
-            }
-        };
-
-        match response.peers {
-            PeerList::Binary(bytes) => {
-                if bytes.len() % 6 != 0 {
-                    return Err(BitTorrentError::Tracker("Invalid peers data".into()));
-                }
-
-                Ok(bytes
-                    .chunks_exact(6)
-                    .filter_map(|chunk| {
-                        let ip = std::net::Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
-                        let port = u16::from_be_bytes([chunk[4], chunk[5]]);
-                        Some(SocketAddrV4::new(ip, port))
-                    })
-                    .collect())
-            }
-            PeerList::Dict(peers) => Ok(peers
-                .into_iter()
-                .filter_map(|peer| {
-                    let ip = peer.ip.parse().ok()?;
-                    Some(SocketAddrV4::new(ip, peer.port))
-                })
-                .collect()),
-        }
+        Ok(peers)
     }
 
     fn build_tracker_url(&self, request: &TrackerRequest) -> Result<Url> {
-        let base_url = format!("{}?", self.announce_url);
-
-        // Manually build query string to avoid double encoding
-        let query = format!(
-            "info_hash={}&peer_id={}&port={}&uploaded={}&downloaded={}&left={}&compact={}&event={}",
-            urlencode(request.info_hash),
-            urlencode(request.peer_id),
-            request.port,
-            request.uploaded,
-            request.downloaded,
-            request.left,
-            request.compact,
-            request.event
-        );
-
-        let url_str = base_url + &query;
-
-        println!("Direct URL: {}", url_str);
-
-        // Parse the complete URL
-        Ok(Url::parse(&url_str).map_err(|e| BitTorrentError::Tracker(e.to_string()))?)
+        // Start with the base URL
+        let base_url = Url::parse(&self.announce_url)
+            .map_err(|e| BitTorrentError::Tracker(e.to_string()))?;
+            
+        let mut query = String::new();
+        
+        query.push_str("?info_hash=");
+        for &byte in request.info_hash {
+            query.push_str(&format!("%{:02x}", byte));
+        }
+        
+        query.push_str("&peer_id=");
+        for &byte in request.peer_id {
+            query.push_str(&format!("%{:02x}", byte));
+        }
+        
+        query.push_str(&format!("&port={}", request.port));
+        query.push_str(&format!("&uploaded={}", request.uploaded));
+        query.push_str(&format!("&downloaded={}", request.downloaded));
+        query.push_str(&format!("&left={}", request.left));
+        query.push_str(&format!("&compact={}", request.compact));
+        query.push_str(&format!("&event={}", request.event));
+        
+        Ok(Url::parse(&format!("{}{}", base_url, query))
+            .map_err(|e| BitTorrentError::Tracker(e.to_string()))?)
     }
 }
 
 fn urlencode(bytes: &[u8]) -> String {
     bytes.iter().map(|&byte| format!("%{:02x}", byte)).collect()
 }
+
