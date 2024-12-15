@@ -6,7 +6,7 @@ mod common;
 async fn test_parse_single_file_torrent() {
     common::create_test_torrent();
     
-    let torrent = Torrent::from_file(common::test_file("debian.torrent"))
+    let torrent = Torrent::from_file(common::test_file("test.torrent"))
         .await
         .expect("Failed to parse torrent file");
     

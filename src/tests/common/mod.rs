@@ -17,5 +17,5 @@ pub fn create_test_torrent() {
     fs::create_dir_all(&path).unwrap();
     
     path.push("debian.torrent");
-    fs::write(path, include_bytes!("../data/debian.torrent")).unwrap();
+    fs::write(path, include_bytes!("../data/Knoppix.torrent")).unwrap();
 }

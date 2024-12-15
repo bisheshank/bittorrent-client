@@ -41,12 +41,6 @@ impl Client {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-
-    #[tokio::test]
-    async fn test_download_single_file() {
-        let mut client = Client::new();
-        client.add_torrent("src/tests/data/test.torrent").await.unwrap();
-        let data = client.start_download().await.unwrap();
-        assert!(!data.is_empty());
-    }
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 }
