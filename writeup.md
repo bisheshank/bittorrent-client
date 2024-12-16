@@ -36,7 +36,3 @@ Torrent {
 ```
 
 Source code: from_file in [torrent.rs](./src/torrent.rs)
-
-### Communicating With Trackers
-
-To begin the download process, our client sends a request to the tracker url to retrieve the list of peers.
