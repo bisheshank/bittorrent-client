@@ -37,6 +37,14 @@ Torrent {
 
 Source code: from_file in [torrent.rs](./src/torrent.rs)
 
+![Torrent Information](pic/pic2.png)
+
+In this terminal output, we can clearly see a multi file torrent with its various parts decoded. This is what we use to query the tracker and go further into connecting with the peers. But here you can see there aren't any peers which was an issue we faced early on. To prevent this, we started to use well seeded peers and mostly linux distributions.
+
+![Torrent Information](pic/pic3.png)
+
+Here is a torrent with no peers.
+
 ### Communicating With Trackers
 
 To begin the download process, our client sends a request to the tracker url to retrieve the list of peer addresses. The request contains identifying information for the client like its id and port it's listening on, along with the info hash of the content it wants to download. The request URL looks something like:
@@ -48,6 +56,12 @@ http://my-announce-url.com/announce?info_hash=infohash&peer_id=peerid&port=6881&
 Where info hash and peer ID are hex numbers like: %d6%9f%91%e6%b2%ae%4c%54%24%68%d1%07%3a%71%d4%ea%13%87%9a%7f.
 
 Source code: get_peers in [tracker.rs](./src/tracker.rs)
+
+![Potential Peer Information](pic/pic10.png)
+
+Here we can see the potential peers found from querying the tracker url. We use the announce url `http://torrent.unix-ag.uni-kl.de/announce` to connect to the tracker at that url and request peers with info hash `%c0%3b%b7%09%bd%7e%fe%79%68%87%75%4%fc%92%
+51%41%491d8b2%87` and `peer_id=82d852853830%30%30%3182d%58%34%e0%6c&c7%bb%d1&e0%17%0a%8848&port=6881&uploaded=0&down loaded=0&left=
+4695273319&compact=1&event=started`. We get a `200 0K` response with successful decoding of 205 potential peers.
 
 ### Connecting to Peers
 
@@ -66,6 +80,8 @@ After retrieving the addresses and ports of the peers, our client is ready to be
 ```
 
 Essentially, peers need to determine compatibility with one another and to inform each other of what protocol they are using to exhange information. Since we are implementing the bittorrent protocol, we have hardcoded the fields. The reserved bytes are also standard, and they are for future extensibility. The info hash must match to make sure both peers are exchanging the same content, and the peer id identifies the sender to others in the swarm (group that's exhanging the same torrent).
+
+![Handshake](pic/pic9.png)
 
 #### Exchanging Messages
 
@@ -103,8 +119,18 @@ To actually download pieces, the client sends an interested message and waits fo
 
 At the end, we check a vector containing failed pieces, and if it contains pieces, we iterate through every peer that has this piece to try to retrieve this missing piece. Finally, we write all the pieces to a file in the client's local file system with the .out extension.
 
+![Downloading](pic/pic4.png)
+
+Initially we also found an issue where if a peer fails (for example, with a `Broken Pipe`), it constantly spams because of the retransmissions. So, we implemented a max retries limit before closing the peer connection.
+
+![Broken pipes](pic/pic5.png)
+
 ### Discussion and Results
 
 ### Conclusions and Future Work
 
 After torrenting files in our own lives, we were curious about how it exactly works and where its dangers lie, leading to this project idea. By developing our own client, we learned a lot about the bittorrent protocol and how peer to peer file sharing works. We realized that even though torrent clients look very simple on the surface, there are quite a lot of complex operations going on at the network level. We also learned that the bittorrent protocol is unsafe these days due to the use of SHA1 as its hashing algorithm, making it susceptible to hash collision attacks. Thankfully, a lot of modern torrent clients have migrated to SHA256. We felt like we struck a good balance on how challenging this project was, it didn't feel extremely trivial or way too hard. For future work, the first step would definitely be including seeding functionality after a client downloads the content. It would also be nice to have an actual UI, as well as support for pausing and resuming downloading. A difficult but interesting thing to add would be DHT, which would allow our client to connect to peers without using a central tracker.
+
+For future work, we could implement partial download data write to the output file. Currently it waits for the download to complete but a partial downlad would ensure that we can acutally observe the writes happening. We also started to implement a better user expereince through `crossterm` in `new-ui` branch but it is still riddled with concurrency issues. 
+
+![Broken pipes](pic/pic13.png)
