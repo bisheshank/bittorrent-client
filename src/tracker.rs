@@ -1,12 +1,11 @@
 // src/tracker.rs
 use crate::{
-    error::{BitTorrentError, Result},
-    torrent::Torrent,
-    utils::generate_peer_id,
+    error::{BitTorrentError, Result}, term::TerminalUI, torrent::Torrent, utils::generate_peer_id
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddrV4;
 use url::Url;
+use std::sync::Arc;
 
 #[derive(Debug, Serialize)]
 struct TrackerRequest<'a> {
@@ -125,11 +124,12 @@ pub struct Tracker {
     uploaded: u64,
     downloaded: u64,
     left: u64,
+    ui: Arc<TerminalUI>,
 }
 
 impl Tracker {
-    pub fn new(torrent: &Torrent) -> Result<Self> {
-        println!("Announce URL: {}", torrent.announce);
+    pub fn new(torrent: &Torrent, ui: Arc<TerminalUI>) -> Result<Self> {
+        ui.add_log(format!("Initializing tracker for: {}", torrent.info.name));
         Ok(Self {
             announce_url: torrent.announce.clone(),
             info_hash: torrent.info_hash(),
@@ -138,10 +138,13 @@ impl Tracker {
             uploaded: 0,
             downloaded: 0,
             left: torrent.total_length() as u64,
+            ui,
         })
     }
 
     pub async fn get_peers(&self) -> Result<Vec<SocketAddrV4>> {
+        self.ui.add_log(format!("Requesting peers from tracker: {}", self.announce_url));
+
         let request = TrackerRequest {
             info_hash: &self.info_hash,
             peer_id: &self.peer_id,
@@ -151,6 +154,7 @@ impl Tracker {
             left: self.left,
             compact: 1,
             event: "started",
+
         };
 
         let url = self.build_tracker_url(&request)?;

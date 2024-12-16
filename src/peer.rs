@@ -2,12 +2,14 @@ use crate::{
     error::{BitTorrentError, Result},
     message::{Message, MessageId},
     piece::PieceInfo,
+    term::TerminalUI,
     utils::bit_set,
     BLOCK_SIZE,
 };
 use bytes::{Buf, BufMut, BytesMut};
 use futures_util::{SinkExt, StreamExt};
 use std::net::{SocketAddr, SocketAddrV4};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
@@ -84,6 +86,7 @@ pub struct Peer {
     am_interested: bool,
     peer_choking: bool,
     peer_interested: bool,
+    ui: Arc<TerminalUI>,
 }
 
 impl Peer {
@@ -91,11 +94,15 @@ impl Peer {
         addr: SocketAddrV4,
         info_hash: [u8; 20],
         peer_id: [u8; 20],
+        ui: Arc<TerminalUI>,
     ) -> Result<Self> {
-        println!("Initiating connection to peer: {}", addr);
+        ui.add_log(format!("Initiating connection to peer: {}", addr));
         let mut stream = TcpStream::connect(addr).await?;
 
-        println!("Connected to peer: {} - Performing handshake", addr);
+        ui.add_log(format!(
+            "Connected to peer: {} - Performing handshake",
+            addr
+        ));
         let handshake = Handshake::new(info_hash, peer_id);
         handshake.write_to(&mut stream).await?;
 
@@ -103,7 +110,7 @@ impl Peer {
         if received.info_hash != info_hash {
             return Err(BitTorrentError::Protocol("Info hash mismatch".into()));
         }
-        println!("Successful handshake: {}", addr);
+        ui.add_log(format!("Successful handshake: {}", addr));
 
         // Now switch to message protocol
         let mut framed = Framed::new(stream, PeerCodec::new());
@@ -128,16 +135,17 @@ impl Peer {
             am_interested: false,
             peer_choking: true,
             peer_interested: false,
+            ui,
         })
     }
 
     pub async fn request_piece(&mut self, piece: &PieceInfo) -> Result<Vec<u8>> {
-        println!(
+        self.ui.add_log(format!(
             "Requesting piece {} ({} bytes) from peer {}",
             piece.index(),
             piece.length(),
             self.addr
-        );
+        ));
 
         if !self.has_piece(piece.index()) {
             return Err(BitTorrentError::Peer("Peer doesn't have piece".into()));
@@ -186,7 +194,8 @@ impl Peer {
 
             match unchoke_result {
                 Ok(Ok(())) => {
-                    println!("Successfully unchoked by peer {}", self.addr);
+                    self.ui
+                        .add_log(format!("Successfully unchoked by peer {}", self.addr));
                 }
                 Ok(Err(e)) => {
                     return Err(e);
@@ -231,6 +240,11 @@ impl Peer {
                             MAX_BLOCK_RETRIES
                         )));
                     }
+                    self.ui.add_log(format!(
+                        "Retrying block download from peer {} (attempt {}/{})",
+                        self.addr, retries, MAX_BLOCK_RETRIES
+                    ));
+
                     // Small delay before retry
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
@@ -253,6 +267,7 @@ impl Peer {
 
         // Wait for piece data
         while let Some(msg) = self.stream.next().await {
+            tokio::task::yield_now().await;
             match msg {
                 Ok(msg) => match msg.id {
                     MessageId::Piece => {
@@ -301,6 +316,7 @@ impl Peer {
     }
 
     async fn handle_message(&mut self, message: Message) -> Result<()> {
+        tokio::task::yield_now().await;
         match message.id {
             MessageId::Choke => self.peer_choking = true,
             MessageId::Unchoke => self.peer_choking = false,

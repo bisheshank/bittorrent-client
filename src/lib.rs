@@ -8,6 +8,7 @@ pub mod message;
 pub mod download;
 pub mod client;
 pub mod utils;
+pub mod term;
 
 #[cfg(test)]
 pub mod tests {
